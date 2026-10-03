@@ -16,6 +16,7 @@ import {
   type BleachLevel
 } from '@/types/coralRecord'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
+import { buildQuotaStates, computeBeltCap, currentQuotaYear } from '@/utils/quota'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['reefs', 'sites', 'belts', 'corals', 'fishes'] as const
@@ -58,13 +59,30 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
+  const year = currentQuotaYear()
+  // 兼容旧备份：旧礁区没核定，先按面积与级别回填一版上限；旧样带一律「待认」
+  const reefs = (obj.reefs ?? []).map((reef) => ({
+    ...reef,
+    beltCap:
+      typeof reef.beltCap === 'number' && reef.beltCap > 0
+        ? reef.beltCap
+        : computeBeltCap(reef.areaKm2 ?? 0, reef.protectStatus ?? '未设区'),
+    capSource: reef.capSource === 'approved' ? ('approved' as const) : ('backfilled' as const),
+    capYear: typeof reef.capYear === 'number' ? reef.capYear : year
+  }))
+  const belts = (obj.belts ?? []).map((belt) => ({
+    ...belt,
+    reviewStatus: belt.reviewStatus === 'approved' ? ('approved' as const) : ('pending' as const),
+    reviewedBy: typeof belt.reviewedBy === 'string' ? belt.reviewedBy : '',
+    reviewedAt: typeof belt.reviewedAt === 'number' ? belt.reviewedAt : null
+  }))
   const payload: BackupPayload = {
     app: 'gbcoralbelt',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
     exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : new Date().toISOString(),
-    reefs: obj.reefs ?? [],
+    reefs,
     sites: obj.sites ?? [],
-    belts: obj.belts ?? [],
+    belts,
     corals: obj.corals ?? [],
     fishes: obj.fishes ?? []
   }
@@ -173,6 +191,10 @@ export interface CoverageLine {
   orientation: string
   surveyDate: string
   observer: string
+  /** 核定对账状态 */
+  reviewStatus: 'approved' | 'pending'
+  /** 是否计入平均口径 */
+  counted: boolean
   coralCount: number
   coverCmTotal: number
   /** 珊瑚覆盖率（%） */
@@ -191,10 +213,11 @@ export interface CoverageLine {
   conclusion: string
 }
 
-/** 按样带生成覆盖度结论行 */
+/** 按样带生成覆盖度结论行（超出核定上限、尚未认账的样带保留可见，但标记为不计入平均） */
 export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
   const reefById = new Map(payload.reefs.map((reef) => [reef.id, reef]))
   const siteById = new Map(payload.sites.map((site) => [site.id, site]))
+  const quotaStates = buildQuotaStates(payload.reefs, payload.sites, payload.belts)
   const coralsByBelt = new Map<string, typeof payload.corals>()
   payload.corals.forEach((coral) => {
     const list = coralsByBelt.get(coral.beltId) ?? []
@@ -212,6 +235,8 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
     .map((belt) => {
       const site = siteById.get(belt.siteId)
       const reef = site ? reefById.get(site.reefId) : undefined
+      const admission = reef ? quotaStates.get(reef.id)?.admission.get(belt.id) : undefined
+      const counted = admission?.counted ?? true
       const corals = coralsByBelt.get(belt.id) ?? []
       const fishes = fishesByBelt.get(belt.id) ?? []
       const coverCmTotal = round(
@@ -242,6 +267,8 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
         orientation: belt.orientation,
         surveyDate: belt.surveyDate,
         observer: belt.observer,
+        reviewStatus: (belt.reviewStatus === 'approved' ? 'approved' : 'pending') as 'approved' | 'pending',
+        counted,
         coralCount: corals.length,
         coverCmTotal,
         coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
@@ -253,23 +280,35 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
         invertebrateTotal,
         fishDensity: fishDensity(fishTotal, belt.lengthM),
         conclusion:
-          corals.length === 0
+          (!counted
+            ? '该样带超出本年度核定上限，暂挡在礁区平均之外，待管理站逐条对账认过后计入；'
+            : '') +
+          (corals.length === 0
             ? '该样带尚未录入珊瑚记录'
             : grade === '无'
               ? `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，未见白化`
-              : `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，白化指数 ${index}（${grade}），白化占比 ${bleachedSharePct(corals)}%`
+              : `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，白化指数 ${index}（${grade}），白化占比 ${bleachedSharePct(corals)}%`)
       }
     })
     .sort((a, b) => b.bleachIndex - a.bleachIndex)
 }
 
-/** 按礁区汇总：站位/样带数量、平均白化指数与总体等级 */
+/** 按礁区汇总：站位/样带数量、平均白化指数与总体等级（平均仅按核定口径计入的样带） */
 export interface ReefSummary {
   reefId: string
   reefName: string
   protectStatus: string
+  /** 核定上限 */
+  beltCap: number
+  capSource: 'approved' | 'backfilled'
+  capYear: number
   siteCount: number
+  /** 已布样带（全部保留） */
   beltCount: number
+  /** 计入平均口径的样带数 */
+  countedBeltCount: number
+  /** 被挡在平均之外的样带数 */
+  blockedBeltCount: number
   coralCount: number
   coverCmTotal: number
   avgBleachIndex: number
@@ -280,19 +319,26 @@ export interface ReefSummary {
 export function buildReefSummaries(payload: BackupPayload, lines: CoverageLine[]): ReefSummary[] {
   return payload.reefs.map((reef) => {
     const siteIds = new Set(payload.sites.filter((site) => site.reefId === reef.id).map((site) => site.id))
-    const beltIds = new Set(payload.belts.filter((belt) => siteIds.has(belt.siteId)).map((belt) => belt.id))
-    const corals = payload.corals.filter((coral) => beltIds.has(coral.beltId))
-    const lines4Reef = lines.filter((line) => line.reefId === reef.id)
+    const reefBelts = payload.belts.filter((belt) => siteIds.has(belt.siteId))
+    const beltIds = new Set(reefBelts.map((belt) => belt.id))
+    const countedLines = lines.filter((line) => line.reefId === reef.id && line.counted)
+    const countedBeltIds = new Set(countedLines.map((line) => line.beltId))
+    const corals = payload.corals.filter((coral) => countedBeltIds.has(coral.beltId))
     const avgBleachIndex =
-      lines4Reef.length === 0
+      countedLines.length === 0
         ? 0
-        : round(lines4Reef.reduce((sum, line) => sum + line.bleachIndex, 0) / lines4Reef.length, 2)
+        : round(countedLines.reduce((sum, line) => sum + line.bleachIndex, 0) / countedLines.length, 2)
     return {
       reefId: reef.id,
       reefName: reef.name,
       protectStatus: reef.protectStatus,
+      beltCap: reef.beltCap,
+      capSource: reef.capSource,
+      capYear: reef.capYear,
       siteCount: siteIds.size,
       beltCount: beltIds.size,
+      countedBeltCount: countedLines.length,
+      blockedBeltCount: beltIds.size - countedLines.length,
       coralCount: corals.length,
       coverCmTotal: round(
         corals.reduce((sum, coral) => sum + coral.coverCm, 0),
@@ -301,7 +347,7 @@ export function buildReefSummaries(payload: BackupPayload, lines: CoverageLine[]
       avgBleachIndex,
       grade: bleachGrade(avgBleachIndex),
       fishTotal: payload.fishes
-        .filter((fish) => beltIds.has(fish.beltId))
+        .filter((fish) => countedBeltIds.has(fish.beltId))
         .reduce((sum, fish) => sum + fish.count, 0)
     }
   })

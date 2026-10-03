@@ -100,12 +100,39 @@ export const useBeltStore = defineStore('belt', () => {
 
   async function createBelt(
     siteId: string,
-    payload: Omit<Belt, 'id' | 'createdAt' | 'updatedAt' | 'siteId'>
+    payload: Omit<Belt, 'id' | 'createdAt' | 'updatedAt' | 'siteId' | 'reviewStatus' | 'reviewedBy' | 'reviewedAt'>
   ): Promise<Belt> {
     const now = Date.now()
-    const row: Belt = { ...payload, siteId, id: createId('belt'), createdAt: now, updatedAt: now }
+    const row: Belt = {
+      ...payload,
+      siteId,
+      // 站位样带归外业队：新布设样带尚未经管理站对账，一律「待认」
+      reviewStatus: 'pending',
+      reviewedBy: '',
+      reviewedAt: null,
+      id: createId('belt'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.belts.put(row)
     return row
+  }
+
+  /**
+   * 管理站逐条对账：认过（pending → approved）后样带才算回平均；
+   * 撤销认账（approved → pending）则重新按上限名额判定。
+   */
+  async function setBeltReview(
+    id: string,
+    reviewStatus: Belt['reviewStatus'],
+    reviewedBy = ''
+  ): Promise<void> {
+    await db.belts.update(id, {
+      reviewStatus,
+      reviewedBy: reviewStatus === 'approved' ? reviewedBy : '',
+      reviewedAt: reviewStatus === 'approved' ? Date.now() : null,
+      updatedAt: Date.now()
+    } as never)
   }
 
   async function updateBelt(id: string, patch: Partial<Belt>): Promise<void> {
@@ -153,6 +180,7 @@ export const useBeltStore = defineStore('belt', () => {
     createBelt,
     updateBelt,
     removeBelt,
+    setBeltReview,
     bulkSetOrientation,
     orientations: ORIENTATIONS
   }

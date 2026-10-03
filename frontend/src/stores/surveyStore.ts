@@ -12,6 +12,7 @@ import type { Reef } from '@/types/reef'
 import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
+import { buildQuotaStates, type QuotaState } from '@/utils/quota'
 
 /** 覆盖度汇总页筛选条件 */
 export interface SurveyFilterState {
@@ -43,6 +44,14 @@ export interface CoverageSummaryRow {
   orientation: string
   surveyDate: string
   observer: string
+  /** 核定对账状态 */
+  reviewStatus: 'approved' | 'pending'
+  reviewedBy: string
+  reviewedAt: number | null
+  /** 是否计入礁区平均口径（false = 超出上限被挡在平均之外） */
+  counted: boolean
+  /** 核定上限 */
+  beltCap: number
   coralCount: number
   coverCmTotal: number
   coveragePct: number
@@ -137,6 +146,31 @@ export const useSurveyStore = defineStore('survey', () => {
     return counts
   })
 
+  /** 各礁区核定口径结果（管理站核定上限 → 哪些样带计入平均） */
+  const quotaStates = computed<Map<string, QuotaState>>(() =>
+    buildQuotaStates(reefs.value, sites.value, belts.value)
+  )
+
+  /** 站位 id → 所属礁区 id */
+  const reefIdBySite = (siteId: string): string | undefined =>
+    sites.value.find((site) => site.id === siteId)?.reefId
+
+  /** 样带在当前核定口径下的计入信息 */
+  function admissionFor(belt: Belt): { counted: boolean; approved: boolean; cap: number } {
+    const reefId = reefIdBySite(belt.siteId)
+    const state = reefId ? quotaStates.value.get(reefId) : undefined
+    return {
+      counted: state?.admission.get(belt.id)?.counted ?? true,
+      approved: belt.reviewStatus === 'approved',
+      cap: state?.cap ?? 0
+    }
+  }
+
+  /** 当前被挡在平均之外的样带数（全库口径） */
+  const blockedBeltCount = computed(
+    () => belts.value.filter((belt) => !admissionFor(belt).counted).length
+  )
+
   /** 覆盖度汇总行（全部样带） */
   const coverageRows = computed<CoverageSummaryRow[]>(() =>
     belts.value
@@ -158,6 +192,7 @@ export const useSurveyStore = defineStore('survey', () => {
         })
         const index = bleachIndex(beltCorals)
         const fishTotal = beltFishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
+        const admission = admissionFor(belt)
         return {
           beltId: belt.id,
           beltNo: belt.no,
@@ -169,6 +204,11 @@ export const useSurveyStore = defineStore('survey', () => {
           orientation: belt.orientation,
           surveyDate: belt.surveyDate,
           observer: belt.observer,
+          reviewStatus: belt.reviewStatus,
+          reviewedBy: belt.reviewedBy,
+          reviewedAt: belt.reviewedAt,
+          counted: admission.counted,
+          beltCap: admission.cap,
           coralCount: beltCorals.length,
           coverCmTotal,
           coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
@@ -212,27 +252,32 @@ export const useSurveyStore = defineStore('survey', () => {
       filter.value.onlyBleached
   )
 
-  /** 全局白化等级分布与总体指数 */
+  /** 全局白化等级分布与总体指数：仅按核定口径计入的样带统计（超出上限的先挡在平均之外） */
   const globalStats = computed(() => {
+    const countedBeltIds = new Set(
+      belts.value.filter((belt) => admissionFor(belt).counted).map((belt) => belt.id)
+    )
+    const countedCorals = corals.value.filter((coral) => countedBeltIds.has(coral.beltId))
     const distribution: Record<BleachLevel, number> = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
     BLEACH_LEVELS.forEach((level) => {
       distribution[level] = round(
-        corals.value.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
+        countedCorals.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
         1
       )
     })
-    const index = bleachIndex(corals.value)
+    const index = bleachIndex(countedCorals)
     return {
-      coralCount: corals.value.length,
+      coralCount: countedCorals.length,
       fishCount: fishes.value.length,
       coverCmTotal: round(
-        corals.value.reduce((sum, coral) => sum + coral.coverCm, 0),
+        countedCorals.reduce((sum, coral) => sum + coral.coverCm, 0),
         1
       ),
       bleachIndex: index,
       grade: bleachGrade(index),
-      bleachedSharePct: bleachedSharePct(corals.value),
-      distribution
+      bleachedSharePct: bleachedSharePct(countedCorals),
+      distribution,
+      countedBeltCount: countedBeltIds.size
     }
   })
 
@@ -388,6 +433,9 @@ export const useSurveyStore = defineStore('survey', () => {
     filteredCoverageRows,
     hasFilter,
     globalStats,
+    quotaStates,
+    blockedBeltCount,
+    admissionFor,
     start,
     coralsOfBelt,
     fishesOfBelt,

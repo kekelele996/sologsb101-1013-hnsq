@@ -16,6 +16,12 @@ export interface Reef {
   protectStatus: ProtectStatus
   /** 管理单位 */
   manager: string
+  /** 本年度核定样带条数上限（管理站核定，按面积与保护级别计算） */
+  beltCap: number
+  /** 上限来源：管理站核定 / 旧数据按面积级别公式回填 */
+  capSource: 'approved' | 'backfilled'
+  /** 核定年度 */
+  capYear: number
   createdAt: number
   updatedAt: number
 }

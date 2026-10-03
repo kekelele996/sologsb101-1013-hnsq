@@ -21,6 +21,7 @@ import {
   groupByGenus,
   round
 } from '@/utils/bleach'
+import { buildQuotaStates } from '@/utils/quota'
 
 /** 单条样带的覆盖度成果 */
 export interface BeltCoverage {
@@ -34,6 +35,10 @@ export interface BeltCoverage {
   orientation: string
   surveyDate: string
   observer: string
+  /** 核定对账状态 */
+  reviewStatus: 'approved' | 'pending'
+  /** 是否计入平均口径（超出核定上限的样带被挡在平均之外） */
+  counted: boolean
   coralCount: number
   coverCmTotal: number
   /** 珊瑚覆盖率（%） */
@@ -125,6 +130,14 @@ export function useCoverage(): UseCoverageResult {
   const siteOf = (siteId: string) => sites.value.find((site) => site.id === siteId) ?? null
   const reefOf = (reefId: string) => reefs.value.find((reef) => reef.id === reefId) ?? null
 
+  /** 各礁区核定口径：决定每条样带是否计入平均 */
+  const quotaStates = computed(() => buildQuotaStates(reefs.value, sites.value, belts.value))
+  const isCounted = (belt: (typeof belts.value)[number]): boolean => {
+    const site = siteOf(belt.siteId)
+    if (!site) return true
+    return quotaStates.value.get(site.reefId)?.admission.get(belt.id)?.counted ?? true
+  }
+
   function buildBeltCoverage(beltId: string): BeltCoverage | null {
     const belt = belts.value.find((item) => item.id === beltId)
     if (!belt) return null
@@ -159,6 +172,8 @@ export function useCoverage(): UseCoverageResult {
       orientation: belt.orientation,
       surveyDate: belt.surveyDate,
       observer: belt.observer,
+      reviewStatus: belt.reviewStatus,
+      counted: isCounted(belt),
       coralCount: beltCorals.length,
       coverCmTotal,
       coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
@@ -189,7 +204,8 @@ export function useCoverage(): UseCoverageResult {
     const site = siteOf(siteId)
     if (!site) return null
     const reef = reefOf(site.reefId)
-    const siteBelts = belts.value.filter((belt) => belt.siteId === site.id)
+    // 站位平均同样按核定口径：超出上限、尚未对账认过的样带先挡在平均之外
+    const siteBelts = belts.value.filter((belt) => belt.siteId === site.id && isCounted(belt))
     const beltIds = new Set(siteBelts.map((belt) => belt.id))
     const siteCorals = corals.value.filter((coral) => beltIds.has(coral.beltId))
     const siteFishes = fishes.value.filter((fish) => beltIds.has(fish.beltId))
@@ -243,10 +259,13 @@ export function useCoverage(): UseCoverageResult {
   )
 
   const globalDistribution = computed<Record<BleachLevel, number>>(() => {
+    const countedBeltIds = new Set(belts.value.filter((belt) => isCounted(belt)).map((belt) => belt.id))
     const distribution = EMPTY_DISTRIBUTION()
     BLEACH_LEVELS.forEach((level) => {
       distribution[level] = round(
-        corals.value.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
+        corals.value
+          .filter((coral) => countedBeltIds.has(coral.beltId) && coral.bleachLevel === level)
+          .reduce((sum, coral) => sum + coral.coverCm, 0),
         1
       )
     })

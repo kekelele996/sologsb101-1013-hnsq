@@ -18,6 +18,12 @@ export interface Belt {
   surveyDate: string
   /** 调查人 */
   observer: string
+  /** 核定对账状态：已认（管理站逐条认过，计入平均）/ 待认（按上限名额判定） */
+  reviewStatus: 'approved' | 'pending'
+  /** 认账人（管理站） */
+  reviewedBy: string
+  /** 认账时间（ms 时间戳） */
+  reviewedAt: number | null
   createdAt: number
   updatedAt: number
 }

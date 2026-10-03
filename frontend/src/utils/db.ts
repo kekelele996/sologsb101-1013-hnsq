@@ -11,9 +11,10 @@ import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import type { CoralRecord } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import { computeBeltCap, currentQuotaYear } from '@/utils/quota'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbcoralbelt'
@@ -86,6 +87,43 @@ export class CoralBeltDatabase extends Dexie {
             })
         }
       })
+
+    // v3：管理站核定口径 —— 礁区加核定上限，样带加对账状态。
+    // 旧数据没有核定记录：上限先按面积与保护级别回填一版，旧样带一律「待认」。
+    this.version(DB_VERSION)
+      .stores({
+        reefs: 'id, name, location, protectStatus, areaKm2, manager, beltCap, capSource, capYear, updatedAt',
+        sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
+        belts: 'id, siteId, no, lengthM, orientation, surveyDate, observer, reviewStatus, updatedAt',
+        corals: 'id, beltId, genus, form, coverCm, bleachLevel, updatedAt',
+        fishes: 'id, beltId, family, count, sizeClass, category, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const year = currentQuotaYear()
+        await tx
+          .table('reefs')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            // 旧数据没核定：按面积与保护级别回填一版上限
+            if (typeof row.beltCap !== 'number') {
+              row.beltCap = computeBeltCap(
+                typeof row.areaKm2 === 'number' ? row.areaKm2 : 0,
+                (row.protectStatus as Parameters<typeof computeBeltCap>[1]) ?? '未设区'
+              )
+            }
+            if (row.capSource !== 'approved' && row.capSource !== 'backfilled') row.capSource = 'backfilled'
+            if (typeof row.capYear !== 'number') row.capYear = year
+          })
+        await tx
+          .table('belts')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            // 已布样带不撤回，全部保留；对账状态默认「待认」，由管理站逐条认
+            if (row.reviewStatus !== 'approved' && row.reviewStatus !== 'pending') row.reviewStatus = 'pending'
+            if (typeof row.reviewedBy !== 'string') row.reviewedBy = ''
+            if (row.reviewedAt !== null && typeof row.reviewedAt !== 'number') row.reviewedAt = null
+          })
+      })
   }
 }
 
@@ -140,6 +178,10 @@ interface SeedBelt {
   orientation: Belt['orientation']
   surveyDate: string
   observer: string
+  /** 核定对账状态（默认待认；演示数据中给一条管理站已认样带） */
+  reviewStatus?: Belt['reviewStatus']
+  reviewedBy?: string
+  reviewedAt?: number | null
   corals: SeedCoral[]
   fishes: SeedFish[]
 }
@@ -152,6 +194,8 @@ export async function seedDemoData(): Promise<void> {
   const now = Date.now()
   const today = new Date(now).toISOString().slice(0, 10)
 
+  const year = currentQuotaYear()
+
   const reefs: Array<Omit<Reef, 'createdAt' | 'updatedAt'>> = [
     {
       id: 'reef_ql01',
@@ -159,7 +203,11 @@ export async function seedDemoData(): Promise<void> {
       location: '海南文昌清澜湾东侧 3.5 km 海域',
       areaKm2: 18.6,
       protectStatus: '核心区',
-      manager: '清澜湾海洋保护站'
+      manager: '清澜湾海洋保护站',
+      // 演示口径：核心区 18.6 km² × 0.1 ≈ 2 条；本礁区已布 3 条，含 1 条管理站已认、1 条待认超限
+      beltCap: 2,
+      capSource: 'backfilled',
+      capYear: year
     },
     {
       id: 'reef_yr02',
@@ -167,7 +215,10 @@ export async function seedDemoData(): Promise<void> {
       location: '西沙永兴岛西侧礁盘外缘',
       areaKm2: 42.3,
       protectStatus: '缓冲区',
-      manager: '西沙海洋环境监测中心'
+      manager: '西沙海洋环境监测中心',
+      beltCap: computeBeltCap(42.3, '缓冲区'),
+      capSource: 'backfilled',
+      capYear: year
     },
     {
       id: 'reef_dz03',
@@ -175,7 +226,10 @@ export async function seedDemoData(): Promise<void> {
       location: '万宁大洲岛南岸潮下带',
       areaKm2: 6.4,
       protectStatus: '实验区',
-      manager: '大洲岛国家级自然保护区管理处'
+      manager: '大洲岛国家级自然保护区管理处',
+      beltCap: computeBeltCap(6.4, '实验区'),
+      capSource: 'backfilled',
+      capYear: year
     }
   ]
 
@@ -227,6 +281,9 @@ export async function seedDemoData(): Promise<void> {
       orientation: '北',
       surveyDate: today,
       observer: '林之遥',
+      reviewStatus: 'approved',
+      reviewedBy: '清澜湾海洋保护站',
+      reviewedAt: now,
       corals: [
         { id: 'cor_ql01a_1', beltId: 'belt_ql01_a', genus: '鹿角珊瑚属', form: '枝状', coverCm: 860, bleachLevel: '无', remark: '长势良好' },
         { id: 'cor_ql01a_2', beltId: 'belt_ql01_a', genus: '杯形珊瑚属', form: '枝状', coverCm: 540, bleachLevel: '轻', remark: '局部褪色' },
@@ -324,10 +381,16 @@ export async function seedDemoData(): Promise<void> {
     await db.sites.bulkPut(sites.map((site, index) => ({ ...site, ...stamp(100 + index) })))
     await db.belts.bulkPut(
       belts.map((belt, index) => {
-        const { corals, fishes, ...rest } = belt
+        const { corals, fishes, reviewStatus, reviewedBy, reviewedAt, ...rest } = belt
         void corals
         void fishes
-        return { ...rest, ...stamp(200 + index) }
+        return {
+          ...rest,
+          ...stamp(200 + index),
+          reviewStatus: reviewStatus ?? 'pending',
+          reviewedBy: reviewedBy ?? '',
+          reviewedAt: reviewedAt ?? null
+        }
       })
     )
     await db.corals.bulkPut(

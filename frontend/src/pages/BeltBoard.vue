@@ -19,6 +19,7 @@ import { BELT_LENGTH_PRESETS, ORIENTATIONS } from '@/types/belt'
 import type { Belt, Orientation } from '@/types/belt'
 import { bleachGrade, bleachIndex, coralCoveragePct, fishDensity } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
+import type { QuotaState } from '@/utils/quota'
 
 const route = useRoute()
 const router = useRouter()
@@ -41,7 +42,10 @@ const form = reactive({
   observer: ''
 })
 
-/** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率与白化指数 */
+/** 本站位所属礁区的核定口径（上限归管理站，外业只读） */
+const quota = computed<QuotaState | undefined>(() => (reef.value ? reefStore.quotaOfReef(reef.value.id) : undefined))
+
+/** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率、白化指数与核定计入状态 */
 const rows = computed(() =>
   beltStore.beltsOfSite(siteId.value).map((belt) => {
     const corals = surveyStore.coralsOfBelt(belt.id)
@@ -49,6 +53,7 @@ const rows = computed(() =>
     const coverCmTotal = corals.reduce((sum, coral) => sum + coral.coverCm, 0)
     const index = bleachIndex(corals)
     const fishTotal = fishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
+    const admission = quota.value?.admission.get(belt.id)
     return {
       belt,
       coralCount: corals.length,
@@ -57,7 +62,9 @@ const rows = computed(() =>
       coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
       bleachIndex: index,
       grade: bleachGrade(index),
-      fishDensity: fishDensity(fishTotal, belt.lengthM)
+      fishDensity: fishDensity(fishTotal, belt.lengthM),
+      approved: admission?.approved ?? false,
+      counted: admission?.counted ?? true
     }
   })
 )
@@ -127,6 +134,18 @@ async function submitForm(): Promise<void> {
   if (duplicated) {
     ElMessage.warning(`同一朝向（${form.orientation}）下样带编号「${form.no.trim()}」已存在`)
     return
+  }
+  // 核定与上限归管理站：外业可照现场继续布，但超出上限的新样带会先挡在平均之外
+  if (!editingId.value && quota.value && quota.value.slotsLeft <= 0) {
+    try {
+      await ElMessageBox.confirm(
+        `本礁区 ${quota.value.capYear} 年度核定上限 ${quota.value.cap} 条，已布 ${quota.value.total} 条，再布将超出上限。超限样带会保留，但在管理站逐条对账认过前不计入礁区平均白化指数。是否继续布设？`,
+        '超出核定上限',
+        { type: 'warning', confirmButtonText: '仍然布设', cancelButtonText: '取消' }
+      )
+    } catch {
+      return
+    }
   }
   submitting.value = true
   try {
@@ -231,7 +250,7 @@ onMounted(() => {
             <el-tag size="small" type="info" effect="plain">{{ site.substrate }}</el-tag>
           </h2>
           <p class="gb-hint">
-            布设样带后录入长度、朝向与调查日期；同朝向内样带编号不可重复，列表按北 → 东 → 南 → 西排序。
+            布设样带后录入长度、朝向与调查日期；同朝向内样带编号不可重复，列表按北 → 东 → 南 → 西排序。核定上限归管理站：超限样带可照现场保留，但在管理站对账认过前不计入礁区平均。
           </p>
         </div>
         <div class="page__actions">
@@ -246,6 +265,18 @@ onMounted(() => {
         <StatBadge label="珊瑚记录" :value="stats.coralCount" suffix="条" tone="success" icon="Histogram" />
         <StatBadge label="计数记录" :value="stats.fishCount" suffix="条" tone="warning" icon="DataLine" />
       </div>
+
+      <el-alert
+        v-if="quota"
+        :type="quota.blockedCount > 0 ? 'error' : 'success'"
+        show-icon
+        :closable="false"
+        :title="
+          `管理站核定（${quota.capYear} 年）：本礁区上限 ${quota.cap} 条 · 已布 ${quota.total} 条 · 已认 ${quota.approvedCount} 条 · 计入平均 ${quota.countedCount} 条` +
+          (quota.blockedCount > 0 ? ` · ${quota.blockedCount} 条超限已挡在平均之外，待管理站对账认回` : '')
+        "
+        class="page__quota"
+      />
 
       <el-alert
         v-if="conflicts.length > 0"
@@ -265,6 +296,15 @@ onMounted(() => {
 
       <el-table v-else :data="rows" border stripe class="gb-table-compact">
         <el-table-column prop="belt.no" label="样带编号" width="110" />
+        <el-table-column label="核定计入" width="120" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.approved" size="small" type="success">已认</el-tag>
+            <el-tag v-else-if="row.counted" size="small" type="info" effect="plain">待认·计入</el-tag>
+            <el-tooltip content="超出本年度核定上限，先挡在礁区平均之外，待管理站逐条认账" placement="top">
+              <el-tag size="small" type="danger" effect="dark">超限·已挡</el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column label="朝向" width="90" align="center">
           <template #default="{ row }">
             <el-tag size="small" effect="plain">{{ row.belt.orientation }}</el-tag>
@@ -406,5 +446,9 @@ onMounted(() => {
   flex-wrap: wrap;
   gap: 2px;
   margin-top: 4px;
+}
+
+.page__quota {
+  margin-top: -2px;
 }
 </style>

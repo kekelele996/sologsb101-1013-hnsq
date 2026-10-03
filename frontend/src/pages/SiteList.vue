@@ -53,13 +53,18 @@ const rows = computed(() => {
     return true
   })
   return sites.map((site) => {
-    const belts = beltStore.beltsOfSite(site.id)
+    const allBelts = beltStore.beltsOfSite(site.id)
+    const quota = reefStore.quotaOfReef(reefId.value)
+    // 站位平均按核定口径：超限待认样带先挡在平均之外
+    const belts = allBelts.filter((belt) => quota?.admission.get(belt.id)?.counted ?? true)
     const beltIds = new Set(belts.map((belt) => belt.id))
     const corals = surveyStore.corals.filter((coral) => beltIds.has(coral.beltId))
     const index = bleachIndex(corals)
     return {
       site,
       beltCount: belts.length,
+      laidCount: allBelts.length,
+      blockedCount: allBelts.length - belts.length,
       beltLengthM: belts.reduce((sum, belt) => sum + belt.lengthM, 0),
       coralCount: corals.length,
       bleachIndex: index,
@@ -291,11 +296,14 @@ onMounted(() => {
           </template>
         </el-table-column>
         <el-table-column prop="site.substrate" label="底质" width="120" />
-        <el-table-column label="样带" width="120" align="center">
+        <el-table-column label="样带（计入/已布）" width="150" align="center">
           <template #default="{ row }">
             <el-button text type="primary" size="small" @click="gotoBelts(row.site)">
-              {{ row.beltCount }} 条 / {{ row.beltLengthM }} m
+              {{ row.beltCount }} / {{ row.laidCount }} 条
             </el-button>
+            <el-tag v-if="row.blockedCount > 0" size="small" type="danger" effect="plain">
+              {{ row.blockedCount }} 条已挡
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="珊瑚记录" width="110" align="right">
