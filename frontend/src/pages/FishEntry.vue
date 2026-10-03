@@ -56,6 +56,11 @@ const records = computed(() => {
   return list.filter((record) => record.category === categoryFilter.value)
 })
 
+/** 该样带的核定口径标记（超出核定暂挂时给出提示） */
+const quotaMark = computed(() => (belt.value ? reefStore.beltQuotaMark(belt.value.id) : undefined))
+const beltExcluded = computed(() => quotaMark.value === 'excluded')
+const beltAccepted = computed(() => belt.value?.reviewStatus === 'accepted')
+
 /** 按科名 + 体长段汇总 */
 const summary = computed(() => surveyStore.fishSummaryOfBelt(beltId.value))
 
@@ -248,6 +253,15 @@ onMounted(() => {
     />
 
     <template v-else>
+      <el-alert
+        v-if="beltExcluded"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="page__quota-alert"
+        title="该样带超出礁区核定上限且尚未认回：鱼类计数照常保留，但暂不计入站位 / 礁区汇总，等管理站认回后自动算回。"
+      />
+      <el-alert v-else-if="beltAccepted" type="success" :closable="false" show-icon class="page__quota-alert" title="该样带已由管理站认回，计入核定口径。" />
       <div class="page__head">
         <div>
           <el-breadcrumb separator="/">
@@ -521,5 +535,9 @@ onMounted(() => {
   margin-top: 10px;
   max-height: 160px;
   overflow: auto;
+}
+
+.page__quota-alert {
+  margin-bottom: 12px;
 }
 </style>

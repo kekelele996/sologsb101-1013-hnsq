@@ -12,10 +12,16 @@ export interface Reef {
   location: string
   /** 面积（km²） */
   areaKm2: number
-  /** 保护区状态 */
+  /** 保护级别 */
   protectStatus: ProtectStatus
   /** 管理单位 */
   manager: string
+  /** 管理站核定的本年度样带布设上限（条）；未核定时为 undefined，口径上不封顶 */
+  quotaBelts?: number
+  /** 核定时间（毫秒时间戳） */
+  quotaCheckedAt?: number
+  /** 核定依据备注（按面积与保护级别回填 / 管理站手动核定） */
+  quotaNote?: string
   createdAt: number
   updatedAt: number
 }

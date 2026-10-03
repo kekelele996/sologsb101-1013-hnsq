@@ -32,14 +32,14 @@ docker compose up -d --build      # 修改代码后重新构建
 | 构建 | Vite 6 | 产物 `dist/`，交给 nginx 托管 |
 | 状态管理 | Pinia 2（setup store） | `reefStore` / `beltStore` / `surveyStore` |
 | 路由 | Vue Router 4（history 模式） | 路径与提示词逐字一致，支持深链刷新 |
-| 持久化 | Dexie 4（IndexedDB，库名 `gbcoralbelt`） | 结构版本 v2 + upgrade 迁移 + liveQuery 订阅 |
+| 持久化 | Dexie 4（IndexedDB，库名 `gbcoralbelt`） | 结构版本 v3 + upgrade 迁移 + liveQuery 订阅 |
 | 容器 | node:20-alpine 构建 → nginx:alpine 运行 | 多阶段构建，运行阶段 `chmod -R a+rX` |
 
 ## 三、路由与功能模块
 
 | 路由 | 页面 | 消费模型 | 主要交互 |
 | --- | --- | --- | --- |
-| `/reefs` | 礁区台账 | Reef、Site、Belt、CoralRecord | 新建/编辑/删除礁区，按保护区状态与面积分档筛选，卡片汇总站位数、样带数与本礁区平均白化指数 |
+| `/reefs` | 礁区台账 | Reef、Site、Belt、CoralRecord | 新建/编辑/删除礁区，按保护区状态与面积分档筛选；卡片按**核定口径**汇总站位数、计入样带数与本礁区平均白化指数，管理站可在此**核定样带上限**并对超限样带**逐条对账认回** |
 | `/reefs/:id/sites` | 站位列表与水深标记 | Site、Reef、Belt | 新增/编辑/删除站位，经纬度校验（纬度 ±90、经度 ±180）并显示度分秒，按水深区间筛选，展开样带 |
 | `/sites/:id/belts` | 样带布设 | Belt、Site、CoralRecord、FishCount | 布设样带（编号、长度、朝向、调查日期、调查人），回显已录记录数、覆盖率与白化指数，朝向排序校验 |
 | `/belts/:id/corals` | 底质与珊瑚分类计数 | CoralRecord、Belt | 按属名与形态逐条录入覆盖长度与白化等级，汇总覆盖率、白化指数、白化占比与等级分布，批量粘贴、批量改级 |
@@ -78,7 +78,7 @@ sologsb101-1013/
         ├── pages/              # ReefList / SiteList / BeltBoard / CoralEntry / FishEntry / CoverageView
         ├── router/index.ts     # 路由表（路径与提示词逐字一致）
         ├── styles/main.css
-        └── utils/              # bleach.ts（白化与覆盖度算法）/ db.ts（Dexie 封装）/ export.ts（导入导出与结论）
+        └── utils/              # bleach.ts（白化与覆盖度算法）/ quota.ts（核定上限与对账口径）/ db.ts（Dexie 封装）/ export.ts（导入导出与结论）
 ```
 
 ## 五、本地开发
@@ -93,10 +93,11 @@ npm run preview    # 预览构建产物
 
 ## 六、数据存储说明
 
-- **存储位置**：浏览器 IndexedDB，库名 `gbcoralbelt`，当前结构版本 `v2`。读写统一经 `frontend/src/utils/db.ts` 封装，页面组件不直接触碰 Dexie 实例。
+- **存储位置**：浏览器 IndexedDB，库名 `gbcoralbelt`，当前结构版本 `v3`。读写统一经 `frontend/src/utils/db.ts` 封装，页面组件不直接触碰 Dexie 实例。
 - **数据表**：`reefs`（礁区）、`sites`（站位）、`belts`（样带）、`corals`（珊瑚记录）、`fishes`（鱼类与无脊椎动物计数）。
-- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳与必填字段（面积、经纬度、水深、样带长度、覆盖长度、计数等）；调整字段结构时递增 `DB_VERSION` 并补迁移。
-- **首屏播种**：`initDatabase()` 在 `reefs` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 个礁区 / 4 个站位 / 5 条样带 / 14 条珊瑚记录 / 12 条计数记录），覆盖「无 / 轻 / 中 / 重 / 死亡」全部白化等级，保证每个页面打开都有内容、层级路由也能命中真实 id。
+- **核定与对账口径（v3）**：核定和上限归管理站（`reefs.quotaBelts` / `quotaCheckedAt` / `quotaNote`），站位样带与珊瑚覆盖归外业队（`belts.reviewStatus`）。核定上限按「面积与保护级别」计算（`utils/quota.ts`：每 10 km² 计 1 条，核心区 ×0.5、缓冲区 ×1、实验区 ×2、未设区 ×3，下限 1、封顶 200），级别一提或面积改小上限即降，管理站也可在礁区卡片「核定上限」中手动调整。上限调低后**已布设样带不撤回**：已认回（`accepted`）的照算，其余按站位 → 朝向（北→东→南→西）→ 编号顺序取满上限条计入，超出的样带标记为「暂挂」（`excluded`），先挡在站位 / 礁区平均白化指数、覆盖率与覆盖度汇总之外；管理站在礁区卡片「逐条对账」中认回后，该样带即时算回各页汇总（再降上限也保留）。尚未核定的礁区不封顶，样带标记 `unlimited` 暂全部计入。
+- **升级迁移**：`db.version(1)` 保留初版结构；`db.version(2)` 补齐索引并回填历史数据缺失的时间戳与必填字段；`db.version(3).stores(...).upgrade(...)` 为旧礁区**按面积和保护级别回填一版核定上限**、把旧样带统一置为「待对账」；调整字段结构时递增 `DB_VERSION` 并补迁移。
+- **首屏播种**：`initDatabase()` 在 `reefs` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 个礁区 / 4 个站位 / 5 条样带 / 14 条珊瑚记录 / 12 条计数记录），覆盖「无 / 轻 / 中 / 重 / 死亡」全部白化等级，并刻意让核心区清澜湾出现「核定 1 条、已布 3 条、1 条已认回、2 条暂挂」的超限对账场景，保证每个页面打开都有内容、层级路由也能命中真实 id。
 - **实时同步**：`utils/db.ts` 的 `watchTable()` 基于 Dexie `liveQuery` 订阅表变化，Pinia store 自动刷新，页面只读消费。
 - **算法口径**：珊瑚覆盖率 = 覆盖长度合计 / 样带长度 × 100%；白化指数 = 按覆盖长度加权的平均白化等级（无 0 / 轻 1 / 中 2 / 重 3 / 死亡 4，0 ~ 4），并按指数换算总体等级；鱼类密度 = 计数 / （样带长度 × 1 m）× 100（尾/100 m²）。
 - **备份与恢复**：`/coverage` 页可导出包含五张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」；备份时间写入 `localStorage`，页脚与汇总页均展示结构版本号。

@@ -12,6 +12,7 @@ import type { Reef } from '@/types/reef'
 import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
+import { buildReefQuotaIndex, isBeltCounted, type BeltQuotaMark } from '@/utils/quota'
 
 /** 覆盖度汇总页筛选条件 */
 export interface SurveyFilterState {
@@ -53,6 +54,10 @@ export interface CoverageSummaryRow {
   fishTotal: number
   invertebrateTotal: number
   fishDensity: number
+  /** 核定口径标记：counted 计入 / excluded 暂挂 / unlimited 礁区未核定 */
+  quotaMark: BeltQuotaMark
+  /** 管理站对账状态 */
+  reviewStatus: 'pending' | 'accepted'
 }
 
 export const useSurveyStore = defineStore('survey', () => {
@@ -137,7 +142,10 @@ export const useSurveyStore = defineStore('survey', () => {
     return counts
   })
 
-  /** 覆盖度汇总行（全部样带） */
+  /** 核定对账索引：超出核定上限且未认回的样带标记 excluded */
+  const quotaIndex = computed(() => buildReefQuotaIndex(reefs.value, sites.value, belts.value))
+
+  /** 覆盖度汇总行（全部样带，含超出核定暂挂在平均之外的） */
   const coverageRows = computed<CoverageSummaryRow[]>(() =>
     belts.value
       .map((belt) => {
@@ -180,10 +188,22 @@ export const useSurveyStore = defineStore('survey', () => {
           invertebrateTotal: beltFishes
             .filter((fish) => fish.category === '无脊椎动物')
             .reduce((sum, fish) => sum + fish.count, 0),
-          fishDensity: fishDensity(fishTotal, belt.lengthM)
+          fishDensity: fishDensity(fishTotal, belt.lengthM),
+          quotaMark: quotaIndex.value.byBelt[belt.id] ?? 'counted',
+          reviewStatus: (belt.reviewStatus === 'accepted' ? 'accepted' : 'pending') as 'pending' | 'accepted'
         }
       })
       .sort((a, b) => b.bleachIndex - a.bleachIndex)
+  )
+
+  /** 计入核定口径的覆盖度行（报出去的礁区情况只算这些） */
+  const countedCoverageRows = computed<CoverageSummaryRow[]>(() =>
+    coverageRows.value.filter((row) => isBeltCounted(row.quotaMark))
+  )
+
+  /** 超出核定、暂挂在平均之外的覆盖度行（管理站逐条认回后会算回去） */
+  const excludedCoverageRows = computed<CoverageSummaryRow[]>(() =>
+    coverageRows.value.filter((row) => row.quotaMark === 'excluded')
   )
 
   /** 按筛选条件过滤后的覆盖度行 */
@@ -212,26 +232,33 @@ export const useSurveyStore = defineStore('survey', () => {
       filter.value.onlyBleached
   )
 
-  /** 全局白化等级分布与总体指数 */
+  /**
+   * 全局白化等级分布与总体指数：只统计「计入核定口径」的样带。
+   * 超出核定且未认回的样带先挡在平均之外，管理站认回后自动算回。
+   */
   const globalStats = computed(() => {
+    const countedBeltIds = new Set(
+      belts.value.filter((belt) => isBeltCounted(quotaIndex.value.byBelt[belt.id])).map((belt) => belt.id)
+    )
+    const countedCorals = corals.value.filter((coral) => countedBeltIds.has(coral.beltId))
     const distribution: Record<BleachLevel, number> = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
     BLEACH_LEVELS.forEach((level) => {
       distribution[level] = round(
-        corals.value.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
+        countedCorals.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
         1
       )
     })
-    const index = bleachIndex(corals.value)
+    const index = bleachIndex(countedCorals)
     return {
-      coralCount: corals.value.length,
-      fishCount: fishes.value.length,
+      coralCount: countedCorals.length,
+      fishCount: fishes.value.filter((fish) => countedBeltIds.has(fish.beltId)).length,
       coverCmTotal: round(
-        corals.value.reduce((sum, coral) => sum + coral.coverCm, 0),
+        countedCorals.reduce((sum, coral) => sum + coral.coverCm, 0),
         1
       ),
       bleachIndex: index,
       grade: bleachGrade(index),
-      bleachedSharePct: bleachedSharePct(corals.value),
+      bleachedSharePct: bleachedSharePct(countedCorals),
       distribution
     }
   })
@@ -385,6 +412,9 @@ export const useSurveyStore = defineStore('survey', () => {
     fishDraft,
     beltRecordCounts,
     coverageRows,
+    countedCoverageRows,
+    excludedCoverageRows,
+    quotaIndex,
     filteredCoverageRows,
     hasFilter,
     globalStats,

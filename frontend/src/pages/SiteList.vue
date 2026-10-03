@@ -53,13 +53,17 @@ const rows = computed(() => {
     return true
   })
   return sites.map((site) => {
-    const belts = beltStore.beltsOfSite(site.id)
+    const allBelts = beltStore.beltsOfSite(site.id)
+    // 站位平均按核定口径：超出上限且未认回的样带先挡在平均之外
+    const belts = allBelts.filter((belt) => reefStore.isBeltInQuota(belt.id))
     const beltIds = new Set(belts.map((belt) => belt.id))
     const corals = surveyStore.corals.filter((coral) => beltIds.has(coral.beltId))
     const index = bleachIndex(corals)
     return {
       site,
-      beltCount: belts.length,
+      beltCount: allBelts.length,
+      countedBeltCount: belts.length,
+      excludedBeltCount: allBelts.length - belts.length,
       beltLengthM: belts.reduce((sum, belt) => sum + belt.lengthM, 0),
       coralCount: corals.length,
       bleachIndex: index,
@@ -267,6 +271,25 @@ onMounted(() => {
         @reset="handleReset"
       />
 
+      <el-alert
+        v-if="reef && typeof reef.quotaBelts === 'number'"
+        :type="(reefStore.quotaStateOf(reef.id)?.excludedCount ?? 0) > 0 ? 'warning' : 'success'"
+        :closable="false"
+        show-icon
+        :title="
+          (reefStore.quotaStateOf(reef.id)?.excludedCount ?? 0) > 0
+            ? `本礁区核定上限 ${reef.quotaBelts} 条，已布 ${reefStore.quotaStateOf(reef.id)?.laidCount} 条，其中 ${reefStore.quotaStateOf(reef.id)?.excludedCount} 条超出核定暂挂、不计入站位平均，请回礁区台账逐条对账认回`
+            : `本礁区核定上限 ${reef.quotaBelts} 条，已布 ${reefStore.quotaStateOf(reef.id)?.laidCount ?? 0} 条，均在核定口径内`
+        "
+      />
+      <el-alert
+        v-else-if="reef"
+        type="info"
+        :closable="false"
+        show-icon
+        title="该礁区尚未核定样带上限，已布样带暂全部计入；请回礁区台账按面积与保护级别回填核定。"
+      />
+
       <EmptyPanel
         v-if="rows.length === 0"
         :title="reefStore.sitesOfReef(reefId).length === 0 ? '该礁区还没有站位' : '没有符合条件的站位'"
@@ -291,11 +314,15 @@ onMounted(() => {
           </template>
         </el-table-column>
         <el-table-column prop="site.substrate" label="底质" width="120" />
-        <el-table-column label="样带" width="120" align="center">
+        <el-table-column label="样带" width="150" align="center">
           <template #default="{ row }">
             <el-button text type="primary" size="small" @click="gotoBelts(row.site)">
-              {{ row.beltCount }} 条 / {{ row.beltLengthM }} m
+              {{ row.countedBeltCount }} 计入 / 共 {{ row.beltCount }} 条
             </el-button>
+            <el-tag v-if="row.excludedBeltCount > 0" size="small" type="warning" effect="plain" class="page__excluded-tag">
+              {{ row.excludedBeltCount }} 条暂挂
+            </el-tag>
+            <div class="gb-hint gb-mono">{{ row.beltLengthM }} m（核定内）</div>
           </template>
         </el-table-column>
         <el-table-column label="珊瑚记录" width="110" align="right">
@@ -303,7 +330,7 @@ onMounted(() => {
             <span class="gb-mono">{{ row.coralCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="平均白化" width="150">
+        <el-table-column label="平均白化（核定口径）" width="170">
           <template #default="{ row }">
             <BleachTag :level="row.grade" :size="'small'" />
             <span class="gb-hint gb-mono"> {{ row.bleachIndex }}</span>
@@ -392,5 +419,9 @@ onMounted(() => {
 
 .page__full {
   width: 100%;
+}
+
+.page__excluded-tag {
+  margin-left: 6px;
 }
 </style>

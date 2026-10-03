@@ -103,13 +103,43 @@ export const useBeltStore = defineStore('belt', () => {
     payload: Omit<Belt, 'id' | 'createdAt' | 'updatedAt' | 'siteId'>
   ): Promise<Belt> {
     const now = Date.now()
-    const row: Belt = { ...payload, siteId, id: createId('belt'), createdAt: now, updatedAt: now }
+    // 外业队照核定布设：新样带一律先挂「待对账」，由管理站逐条认回后才计入核定口径
+    const row: Belt = {
+      ...payload,
+      reviewStatus: payload.reviewStatus ?? 'pending',
+      siteId,
+      id: createId('belt'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.belts.put(row)
     return row
   }
 
   async function updateBelt(id: string, patch: Partial<Belt>): Promise<void> {
     await db.belts.update(id, { ...patch, updatedAt: Date.now() } as never)
+  }
+
+  /** 管理站对账认回：该样带计入核定口径，即使超出上限也算回去 */
+  async function acceptBelt(id: string, note?: string): Promise<void> {
+    const now = Date.now()
+    await db.belts.update(id, {
+      reviewStatus: 'accepted',
+      reviewedAt: now,
+      reviewNote: note?.trim() || '管理站逐条对账认回',
+      updatedAt: now
+    } as never)
+  }
+
+  /** 管理站退回：取消认回，样带回到待对账（外业记录不删除） */
+  async function unacceptBelt(id: string, note?: string): Promise<void> {
+    const now = Date.now()
+    await db.belts.update(id, {
+      reviewStatus: 'pending',
+      reviewedAt: undefined,
+      reviewNote: note?.trim() || undefined,
+      updatedAt: now
+    } as never)
   }
 
   /** 删除样带：级联删除其珊瑚记录与鱼类计数 */
@@ -152,6 +182,8 @@ export const useBeltStore = defineStore('belt', () => {
     beltById,
     createBelt,
     updateBelt,
+    acceptBelt,
+    unacceptBelt,
     removeBelt,
     bulkSetOrientation,
     orientations: ORIENTATIONS

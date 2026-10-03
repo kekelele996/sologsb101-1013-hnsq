@@ -31,6 +31,7 @@ import {
 } from '@/utils/db'
 import {
   buildBackupPayload,
+  buildCoverageLines,
   buildReefSummaries,
   countPayload,
   exportBackupJson,
@@ -65,27 +66,34 @@ const filterModel = computed<FilterModel>(() => ({
 
 const rows = computed(() => surveyStore.filteredCoverageRows)
 
+/** 报出去的核定口径：只统计计入上限的样带 */
+const countedRows = computed(() => rows.value.filter((row) => row.quotaMark !== 'excluded'))
+const excludedRows = computed(() => rows.value.filter((row) => row.quotaMark === 'excluded'))
+
 const totals = computed(() => ({
-  belts: rows.value.length,
-  coralCount: rows.value.reduce((sum, row) => sum + row.coralCount, 0),
-  coverCmTotal: rows.value.reduce((sum, row) => sum + row.coverCmTotal, 0),
-  fishTotal: rows.value.reduce((sum, row) => sum + row.fishTotal, 0),
+  belts: countedRows.value.length,
+  beltsExcluded: excludedRows.value.length,
+  coralCount: countedRows.value.reduce((sum, row) => sum + row.coralCount, 0),
+  coverCmTotal: countedRows.value.reduce((sum, row) => sum + row.coverCmTotal, 0),
+  fishTotal: countedRows.value.reduce((sum, row) => sum + row.fishTotal, 0),
   avgCoveragePct:
-    rows.value.length === 0
+    countedRows.value.length === 0
       ? 0
-      : Number((rows.value.reduce((sum, row) => sum + row.coveragePct, 0) / rows.value.length).toFixed(2)),
+      : Number((countedRows.value.reduce((sum, row) => sum + row.coveragePct, 0) / countedRows.value.length).toFixed(2)),
   avgBleachIndex:
-    rows.value.length === 0
+    countedRows.value.length === 0
       ? 0
-      : Number((rows.value.reduce((sum, row) => sum + row.bleachIndex, 0) / rows.value.length).toFixed(2)),
-  bleachedBelts: rows.value.filter((row) => row.bleachedSharePct > 0).length
+      : Number((countedRows.value.reduce((sum, row) => sum + row.bleachIndex, 0) / countedRows.value.length).toFixed(2)),
+  bleachedBelts: countedRows.value.filter((row) => row.bleachedSharePct > 0).length
 }))
 
-/** 当前筛选结果内的白化等级分布 */
+/** 当前筛选结果内、核定口径内的白化等级分布 */
 const distribution = computed<Record<BleachLevel, number>>(() => {
   const result: Record<BleachLevel, number> = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
   BLEACH_LEVELS.forEach((level) => {
-    result[level] = Number(rows.value.reduce((sum, row) => sum + row.distribution[level], 0).toFixed(1))
+    result[level] = Number(
+      countedRows.value.reduce((sum, row) => sum + row.distribution[level], 0).toFixed(1)
+    )
   })
   return result
 })
@@ -99,34 +107,17 @@ function barPercent(value: number, total: number): string {
   return `${Math.min(100, (value / total) * 100).toFixed(1)}%`
 }
 
+/** 超出核定暂挂的样带行灰显（仍保留展示，但不进平均） */
+function coverageRowClass({ row }: { row: (typeof rows.value)[number] }): string {
+  return row.quotaMark === 'excluded' ? 'row-excluded' : ''
+}
+
 async function refresh(): Promise<void> {
   counts.value = (await countAll()) as CountMap
   lastBackupAt.value = readLastBackupAt()
   stampedVersion.value = readStampedDbVersion()
   const payload = await buildBackupPayload()
-  reefSummaries.value = buildReefSummaries(payload, surveyStore.coverageRows.map((row) => ({
-    beltId: row.beltId,
-    beltNo: row.beltNo,
-    reefId: row.reefId,
-    reefName: row.reefName,
-    siteId: row.siteId,
-    siteNo: row.siteNo,
-    lengthM: row.lengthM,
-    orientation: row.orientation,
-    surveyDate: row.surveyDate,
-    observer: row.observer,
-    coralCount: row.coralCount,
-    coverCmTotal: row.coverCmTotal,
-    coveragePct: row.coveragePct,
-    bleachIndex: row.bleachIndex,
-    grade: row.grade,
-    bleachedSharePct: row.bleachedSharePct,
-    distribution: row.distribution,
-    fishTotal: row.fishTotal,
-    invertebrateTotal: row.invertebrateTotal,
-    fishDensity: row.fishDensity,
-    conclusion: ''
-  })))
+  reefSummaries.value = buildReefSummaries(payload, buildCoverageLines(payload))
 }
 
 function handleFilterChange(): void {
@@ -214,12 +205,18 @@ async function handleDatabaseReset(): Promise<void> {
 }
 
 async function copySummary(): Promise<void> {
-  const text = rows.value
-    .map(
-      (row) =>
-        `${row.reefName}｜站位 ${row.siteNo}｜样带 ${row.beltNo}（${row.orientation}向 ${row.lengthM} m）：珊瑚覆盖率 ${row.coveragePct}%，白化指数 ${row.bleachIndex}（${row.grade}），白化占比 ${row.bleachedSharePct}%，鱼类 ${row.fishTotal} 尾（${row.fishDensity} 尾/100m²）`
+  const lines = countedRows.value.map(
+    (row) =>
+      `${row.reefName}｜站位 ${row.siteNo}｜样带 ${row.beltNo}（${row.orientation}向 ${row.lengthM} m）：珊瑚覆盖率 ${row.coveragePct}%，白化指数 ${row.bleachIndex}（${row.grade}），白化占比 ${row.bleachedSharePct}%，鱼类 ${row.fishTotal} 尾（${row.fishDensity} 尾/100m²）`
+  )
+  if (excludedRows.value.length > 0) {
+    lines.push(
+      `另有 ${excludedRows.value.length} 条样带超出核定上限暂挂待认回，未计入上述平均：${excludedRows.value
+        .map((row) => `${row.reefName} ${row.beltNo}`)
+        .join('、')}`
     )
-    .join('\n')
+  }
+  const text = lines.join('\n')
   try {
     await navigator.clipboard.writeText(text)
     notice.value = '覆盖度结论已复制到剪贴板。'
@@ -261,8 +258,16 @@ onMounted(() => {
 
     <el-alert v-if="notice" type="success" :closable="false" show-icon :title="notice" />
 
+    <el-alert
+      v-if="totals.beltsExcluded > 0"
+      type="warning"
+      :closable="false"
+      show-icon
+      :title="`当前筛选下有 ${totals.beltsExcluded} 条样带超出礁区核定上限且尚未认回，记录保留、暂不计入下列平均与分布，等管理站逐条认回后算回。`"
+    />
+
     <div class="gb-stats-row">
-      <StatBadge label="样带数" :value="totals.belts" suffix="条" icon="Files" />
+      <StatBadge label="核定内样带" :value="totals.belts" suffix="条" icon="Files" />
       <StatBadge label="珊瑚记录" :value="totals.coralCount" suffix="条" tone="info" icon="Histogram" />
       <StatBadge label="覆盖长度合计" :value="totals.coverCmTotal" suffix="cm" tone="success" icon="Odometer" />
       <StatBadge label="平均覆盖率" :value="totals.avgCoveragePct" suffix="%" :percent="Math.min(100, totals.avgCoveragePct)" icon="PieChart" />
@@ -322,8 +327,8 @@ onMounted(() => {
 
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
-        <h3>按样带的覆盖度成果（{{ rows.length }} 条）</h3>
-        <span class="gb-hint">按白化指数降序排列</span>
+        <h3>按样带的覆盖度成果（共 {{ rows.length }} 条，核定内 {{ countedRows.length }} 条）</h3>
+        <span class="gb-hint">按白化指数降序；暂挂样带灰显，不计入平均</span>
       </div>
 
       <EmptyPanel
@@ -333,11 +338,28 @@ onMounted(() => {
         compact
       />
 
-      <el-table v-else :data="rows" border stripe class="gb-table-compact">
+      <el-table
+        v-else
+        :data="rows"
+        border
+        stripe
+        class="gb-table-compact"
+        :row-class-name="coverageRowClass"
+      >
         <el-table-column label="礁区 / 站位" min-width="180">
           <template #default="{ row }">
             <div>{{ row.reefName }}</div>
             <div class="gb-hint">站位 {{ row.siteNo }} · 样带 {{ row.beltNo }}（{{ row.orientation }}向）</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="核定口径" width="150">
+          <template #default="{ row }">
+            <el-tag :type="row.reviewStatus === 'accepted' ? 'success' : 'info'" size="small" effect="plain">
+              {{ row.reviewStatus === 'accepted' ? '已认回' : '待对账' }}
+            </el-tag>
+            <el-tag v-if="row.quotaMark === 'excluded'" size="small" type="warning" effect="dark" class="page__mark-tag">暂挂</el-tag>
+            <el-tag v-else-if="row.quotaMark === 'unlimited'" size="small" type="info" effect="plain" class="page__mark-tag">未核定</el-tag>
+            <el-tag v-else size="small" type="success" effect="plain" class="page__mark-tag">已计入</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="样带长度" width="110" align="right">
@@ -401,34 +423,47 @@ onMounted(() => {
 
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
-        <h3>按礁区的白化评定</h3>
-        <span class="gb-hint">平均白化指数为礁区内各样带白化指数的算术平均</span>
+        <h3>按礁区的白化评定（核定口径）</h3>
+        <span class="gb-hint">平均白化指数只取核定上限以内及已认回的样带；暂挂样带不计入</span>
       </div>
       <el-table :data="reefSummaries" border stripe class="gb-table-compact">
-        <el-table-column prop="reefName" label="礁区" min-width="160" />
-        <el-table-column prop="protectStatus" label="保护区状态" width="130" />
-        <el-table-column label="站位 / 样带" width="130" align="right">
+        <el-table-column prop="reefName" label="礁区" min-width="150" />
+        <el-table-column prop="protectStatus" label="保护级别" width="100" />
+        <el-table-column label="核定 / 已布" width="120" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.siteCount }} / {{ row.beltCount }}</span>
+            <span class="gb-mono">{{ row.quotaBelts ?? '未核定' }} / {{ row.beltCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="珊瑚记录" width="110" align="right">
+        <el-table-column label="站位" width="70" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.siteCount }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="计入样带" width="90" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.countedBeltCount }}</span>
+            <el-tag v-if="row.excludedBeltCount > 0" size="small" type="warning" effect="plain" class="page__mark-tag">
+              暂挂 {{ row.excludedBeltCount }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="珊瑚记录" width="90" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coralCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="覆盖长度" width="130" align="right">
+        <el-table-column label="覆盖长度" width="120" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coverCmTotal }} cm</span>
           </template>
         </el-table-column>
-        <el-table-column label="平均白化指数" width="160">
+        <el-table-column label="平均白化指数" width="150">
           <template #default="{ row }">
             <BleachTag :level="row.grade" size="small" />
             <span class="gb-hint gb-mono"> {{ row.avgBleachIndex }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="鱼类计数" width="120" align="right">
+        <el-table-column label="鱼类计数" width="100" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.fishTotal }}</span>
           </template>
@@ -529,5 +564,14 @@ onMounted(() => {
 .page__mini-bar {
   display: block;
   height: 100%;
+}
+
+.page__mark-tag {
+  margin-left: 4px;
+}
+
+:deep(.el-table .row-excluded td) {
+  background-color: #fdf6ec;
+  color: #a07a44;
 }
 </style>

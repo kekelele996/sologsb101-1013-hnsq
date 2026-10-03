@@ -16,6 +16,11 @@ import {
   type BleachLevel
 } from '@/types/coralRecord'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
+import {
+  buildReefQuotaIndex,
+  isBeltCounted,
+  type BeltQuotaMark
+} from '@/utils/quota'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['reefs', 'sites', 'belts', 'corals', 'fishes'] as const
@@ -188,13 +193,24 @@ export interface CoverageLine {
   invertebrateTotal: number
   /** 鱼类密度（尾 / 100 m²） */
   fishDensity: number
+  /** 核定口径标记 */
+  quotaMark: BeltQuotaMark
+  /** 是否计入核定口径 */
+  countedInQuota: boolean
+  /** 管理站对账状态 */
+  reviewStatus: 'pending' | 'accepted'
   conclusion: string
 }
 
-/** 按样带生成覆盖度结论行 */
+/**
+ * 按样带生成覆盖度结论行。
+ * 全部样带都保留在报告里（外业记录不撤回），但 quotaMark=excluded 的样带
+ * 不参与按礁区汇总的平均值；结论中标注「超出核定，暂挂待认回」。
+ */
 export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
   const reefById = new Map(payload.reefs.map((reef) => [reef.id, reef]))
   const siteById = new Map(payload.sites.map((site) => [site.id, site]))
+  const quotaIndex = buildReefQuotaIndex(payload.reefs, payload.sites, payload.belts)
   const coralsByBelt = new Map<string, typeof payload.corals>()
   payload.corals.forEach((coral) => {
     const list = coralsByBelt.get(coral.beltId) ?? []
@@ -231,6 +247,19 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
       const invertebrateTotal = fishes
         .filter((fish) => fish.category === '无脊椎动物')
         .reduce((sum, fish) => sum + fish.count, 0)
+      const quotaMark: BeltQuotaMark = quotaIndex.byBelt[belt.id] ?? 'counted'
+      const countedInQuota = isBeltCounted(quotaMark)
+      const reviewStatus: 'pending' | 'accepted' = belt.reviewStatus === 'accepted' ? 'accepted' : 'pending'
+      let conclusion: string
+      if (quotaMark === 'excluded') {
+        conclusion = `超出核定上限，暂挂待认回，暂不计入礁区平均；白化指数 ${index}（${grade}）`
+      } else if (corals.length === 0) {
+        conclusion = '该样带尚未录入珊瑚记录'
+      } else if (grade === '无') {
+        conclusion = `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，未见白化`
+      } else {
+        conclusion = `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，白化指数 ${index}（${grade}），白化占比 ${bleachedSharePct(corals)}%`
+      }
       return {
         beltId: belt.id,
         beltNo: belt.no,
@@ -252,24 +281,29 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
         fishTotal,
         invertebrateTotal,
         fishDensity: fishDensity(fishTotal, belt.lengthM),
-        conclusion:
-          corals.length === 0
-            ? '该样带尚未录入珊瑚记录'
-            : grade === '无'
-              ? `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，未见白化`
-              : `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，白化指数 ${index}（${grade}），白化占比 ${bleachedSharePct(corals)}%`
+        quotaMark,
+        countedInQuota,
+        reviewStatus,
+        conclusion
       }
     })
     .sort((a, b) => b.bleachIndex - a.bleachIndex)
 }
 
-/** 按礁区汇总：站位/样带数量、平均白化指数与总体等级 */
+/** 按礁区汇总：站位/样带数量、核定口径与平均白化指数 */
 export interface ReefSummary {
   reefId: string
   reefName: string
   protectStatus: string
   siteCount: number
+  /** 已布设样带总数（含暂挂的） */
   beltCount: number
+  /** 核定上限；undefined 表示尚未核定 */
+  quotaBelts: number | undefined
+  /** 计入核定口径的样带数 */
+  countedBeltCount: number
+  /** 超出核定、暂挂的样带数 */
+  excludedBeltCount: number
   coralCount: number
   coverCmTotal: number
   avgBleachIndex: number
@@ -278,11 +312,19 @@ export interface ReefSummary {
 }
 
 export function buildReefSummaries(payload: BackupPayload, lines: CoverageLine[]): ReefSummary[] {
+  const quotaIndex = buildReefQuotaIndex(payload.reefs, payload.sites, payload.belts)
   return payload.reefs.map((reef) => {
     const siteIds = new Set(payload.sites.filter((site) => site.reefId === reef.id).map((site) => site.id))
-    const beltIds = new Set(payload.belts.filter((belt) => siteIds.has(belt.siteId)).map((belt) => belt.id))
-    const corals = payload.corals.filter((coral) => beltIds.has(coral.beltId))
-    const lines4Reef = lines.filter((line) => line.reefId === reef.id)
+    const allBeltIds = new Set(payload.belts.filter((belt) => siteIds.has(belt.siteId)).map((belt) => belt.id))
+    // 报出去的礁区情况按核定口径：仅计入 counted / unlimited 的样带
+    const countedBeltIds = new Set(
+      payload.belts
+        .filter((belt) => allBeltIds.has(belt.id) && isBeltCounted(quotaIndex.byBelt[belt.id]))
+        .map((belt) => belt.id)
+    )
+    const corals = payload.corals.filter((coral) => countedBeltIds.has(coral.beltId))
+    const lines4Reef = lines.filter((line) => line.reefId === reef.id && line.countedInQuota)
+    const quota = quotaIndex.byReef[reef.id]
     const avgBleachIndex =
       lines4Reef.length === 0
         ? 0
@@ -292,7 +334,10 @@ export function buildReefSummaries(payload: BackupPayload, lines: CoverageLine[]
       reefName: reef.name,
       protectStatus: reef.protectStatus,
       siteCount: siteIds.size,
-      beltCount: beltIds.size,
+      beltCount: allBeltIds.size,
+      quotaBelts: typeof reef.quotaBelts === 'number' ? reef.quotaBelts : undefined,
+      countedBeltCount: countedBeltIds.size,
+      excludedBeltCount: quota?.excludedCount ?? 0,
       coralCount: corals.length,
       coverCmTotal: round(
         corals.reduce((sum, coral) => sum + coral.coverCm, 0),
@@ -301,7 +346,7 @@ export function buildReefSummaries(payload: BackupPayload, lines: CoverageLine[]
       avgBleachIndex,
       grade: bleachGrade(avgBleachIndex),
       fishTotal: payload.fishes
-        .filter((fish) => beltIds.has(fish.beltId))
+        .filter((fish) => countedBeltIds.has(fish.beltId))
         .reduce((sum, fish) => sum + fish.count, 0)
     }
   })

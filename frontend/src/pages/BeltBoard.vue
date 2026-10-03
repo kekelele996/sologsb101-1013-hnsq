@@ -41,7 +41,7 @@ const form = reactive({
   observer: ''
 })
 
-/** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率与白化指数 */
+/** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率与白化指数（按核定口径标记） */
 const rows = computed(() =>
   beltStore.beltsOfSite(siteId.value).map((belt) => {
     const corals = surveyStore.coralsOfBelt(belt.id)
@@ -49,6 +49,7 @@ const rows = computed(() =>
     const coverCmTotal = corals.reduce((sum, coral) => sum + coral.coverCm, 0)
     const index = bleachIndex(corals)
     const fishTotal = fishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
+    const quotaMark = reef ? reefStore.beltQuotaMark(belt.id) : undefined
     return {
       belt,
       coralCount: corals.length,
@@ -57,10 +58,25 @@ const rows = computed(() =>
       coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
       bleachIndex: index,
       grade: bleachGrade(index),
-      fishDensity: fishDensity(fishTotal, belt.lengthM)
+      fishDensity: fishDensity(fishTotal, belt.lengthM),
+      reviewStatus: belt.reviewStatus === 'accepted' ? 'accepted' : 'pending',
+      quotaMark
     }
   })
 )
+
+/** 本站位所在礁区的核定情况 */
+const reefQuota = computed(() => (reef.value ? reefStore.quotaStateOf(reef.value.id) : null))
+
+/** 本站位超出核定、暂挂的样带数 */
+const excludedHere = computed(
+  () => rows.value.filter((row) => row.quotaMark === 'excluded').length
+)
+
+/** 超出核定暂挂的样带行底色提醒（外业可见、记录不撤回） */
+function beltRowClass({ row }: { row: (typeof rows.value)[number] }): string {
+  return row.quotaMark === 'excluded' ? 'row-excluded' : ''
+}
 
 const conflicts = computed(() => beltStore.findBeltConflicts(siteId.value))
 
@@ -143,7 +159,17 @@ async function submitForm(): Promise<void> {
     } else {
       const created = await beltStore.createBelt(siteId.value, payload)
       beltStore.selectBelt(created.id)
-      ElMessage.success(`样带 ${created.no}（${created.orientation}向 ${created.lengthM} m）已布设，可录入底质与珊瑚计数`)
+      const state = reef.value ? reefStore.quotaStateOf(reef.value.id) : null
+      const willExclude =
+        reef.value !== null &&
+        state !== null &&
+        typeof state.quotaBelts === 'number' &&
+        state.countedCount >= state.quotaBelts
+      ElMessage[willExclude ? 'warning' : 'success'](
+        willExclude
+          ? `样带 ${created.no} 已布设，但本礁区核定上限 ${state?.quotaBelts} 条已满，该条先挂在平均之外，等管理站对账认回`
+          : `样带 ${created.no}（${created.orientation}向 ${created.lengthM} m）已布设，可录入底质与珊瑚计数`
+      )
     }
     dialogVisible.value = false
   } finally {
@@ -248,6 +274,27 @@ onMounted(() => {
       </div>
 
       <el-alert
+        v-if="reef && reefQuota && typeof reefQuota.quotaBelts === 'number'"
+        :type="excludedHere > 0 ? 'warning' : reefQuota.overQuota ? 'warning' : 'success'"
+        :closable="false"
+        show-icon
+        class="page__quota-alert"
+        :title="
+          excludedHere > 0
+            ? `本礁区核定上限 ${reefQuota.quotaBelts} 条：本站位有 ${excludedHere} 条样带超出核定，外业记录保留、暂不计入礁区与站位平均，请联系管理站在礁区台账逐条认回`
+            : `本礁区核定上限 ${reefQuota.quotaBelts} 条，全礁区已布 ${reefQuota.laidCount} 条、计入 ${reefQuota.countedCount} 条；本站位样带均在核定口径内`
+        "
+      />
+      <el-alert
+        v-else-if="reef"
+        type="info"
+        :closable="false"
+        show-icon
+        class="page__quota-alert"
+        title="本礁区尚未核定样带上限，样带暂全部计入；管理站回填核定后以核定口径为准。"
+      />
+
+      <el-alert
         v-if="conflicts.length > 0"
         type="warning"
         show-icon
@@ -263,8 +310,18 @@ onMounted(() => {
         @action="openCreate"
       />
 
-      <el-table v-else :data="rows" border stripe class="gb-table-compact">
+      <el-table v-else :data="rows" border stripe class="gb-table-compact" :row-class-name="beltRowClass">
         <el-table-column prop="belt.no" label="样带编号" width="110" />
+        <el-table-column label="对账 / 口径" width="170">
+          <template #default="{ row }">
+            <el-tag :type="row.reviewStatus === 'accepted' ? 'success' : 'info'" size="small" effect="plain">
+              {{ row.reviewStatus === 'accepted' ? '已认回' : '待对账' }}
+            </el-tag>
+            <el-tag v-if="row.quotaMark === 'excluded'" size="small" type="warning" effect="dark" class="page__mark-tag">暂挂不计入</el-tag>
+            <el-tag v-else-if="row.quotaMark === 'unlimited'" size="small" type="info" effect="plain" class="page__mark-tag">未核定</el-tag>
+            <el-tag v-else size="small" type="success" effect="plain" class="page__mark-tag">已计入</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="朝向" width="90" align="center">
           <template #default="{ row }">
             <el-tag size="small" effect="plain">{{ row.belt.orientation }}</el-tag>
@@ -406,5 +463,17 @@ onMounted(() => {
   flex-wrap: wrap;
   gap: 2px;
   margin-top: 4px;
+}
+
+.page__quota-alert {
+  margin-top: -2px;
+}
+
+.page__mark-tag {
+  margin-left: 4px;
+}
+
+:deep(.el-table .row-excluded td) {
+  background-color: #fdf6ec;
 }
 </style>

@@ -9,11 +9,20 @@ import type { Reef, ReefFilterState } from '@/types/reef'
 import { createEmptyReefFilter } from '@/types/reef'
 import type { Site, SiteFilterState } from '@/types/site'
 import { createEmptySiteFilter } from '@/types/site'
+import type { Belt } from '@/types/belt'
 import { bleachIndex, round } from '@/utils/bleach'
+import {
+  buildReefQuotaIndex,
+  computeQuotaBelts,
+  isBeltCounted,
+  type BeltQuotaMark,
+  type ReefQuotaState
+} from '@/utils/quota'
 
 export const useReefStore = defineStore('reef', () => {
   const reefs = ref<Reef[]>([])
   const sites = ref<Site[]>([])
+  const belts = ref<Belt[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
   const currentReefId = ref<string | null>(readLastReefId())
@@ -34,6 +43,10 @@ export const useReefStore = defineStore('reef', () => {
     })
     watchTable<Site>(() => db.sites).subscribe((rows) => {
       sites.value = rows
+    })
+    // 核定口径要用到样带布设与对账状态（与 beltStore 各自订阅同一张表）
+    watchTable<Belt>(() => db.belts).subscribe((rows) => {
+      belts.value = rows
     })
   }
 
@@ -104,6 +117,47 @@ export const useReefStore = defineStore('reef', () => {
     return stats
   })
 
+  /**
+   * 核定对账索引：随礁区 / 站位 / 样带变化重算。
+   * 超出核定上限且未认回的样带标记为 excluded，先挡在平均之外。
+   */
+  const quotaIndex = computed(() => buildReefQuotaIndex(reefs.value, sites.value, belts.value))
+
+  /** 各礁区核定情况 */
+  const reefQuotaStates = computed<Record<string, ReefQuotaState>>(() => quotaIndex.value.byReef)
+
+  /** 取某礁区核定情况（尚未建索引时返回 null） */
+  function quotaStateOf(reefId: string | null | undefined): ReefQuotaState | null {
+    if (!reefId) return null
+    return quotaIndex.value.byReef[reefId] ?? null
+  }
+
+  /** 取某样带在核定口径下的标记 */
+  function beltQuotaMark(beltId: string): BeltQuotaMark | undefined {
+    return quotaIndex.value.byBelt[beltId]
+  }
+
+  /** 某样带是否计入核定口径（查不到索引时按计入处理，保持未核定时的旧行为） */
+  function isBeltInQuota(beltId: string): boolean {
+    return isBeltCounted(quotaIndex.value.byBelt[beltId])
+  }
+
+  /** 某礁区下「计入核定口径」的样带（顺序与外业布设一致） */
+  function countedBeltsOfReef(reefId: string): Belt[] {
+    const siteIds = new Set(sites.value.filter((site) => site.reefId === reefId).map((site) => site.id))
+    return belts.value.filter((belt) => siteIds.has(belt.siteId) && isBeltInQuota(belt.id))
+  }
+
+  /** 某站位下「计入核定口径」的样带 */
+  function countedBeltsOfSite(siteId: string): Belt[] {
+    return belts.value.filter((belt) => belt.siteId === siteId && isBeltInQuota(belt.id))
+  }
+
+  /** 按当前面积与保护级别算出的建议核定上限（管理站核定 / 回填用） */
+  function suggestQuota(areaKm2: number, protectStatus: Reef['protectStatus']): number {
+    return computeQuotaBelts(areaKm2, protectStatus)
+  }
+
   function patchFilter(patch: Partial<ReefFilterState>): void {
     filter.value = { ...filter.value, ...patch }
   }
@@ -143,7 +197,13 @@ export const useReefStore = defineStore('reef', () => {
 
   async function createReef(payload: Omit<Reef, 'id' | 'createdAt' | 'updatedAt'>): Promise<Reef> {
     const now = Date.now()
-    const row: Reef = { ...payload, id: createId('reef'), createdAt: now, updatedAt: now }
+    const row: Reef = {
+      ...payload,
+      ...(typeof payload.quotaBelts === 'number' ? { quotaCheckedAt: payload.quotaCheckedAt ?? now } : {}),
+      id: createId('reef'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.reefs.put(row)
     return row
   }
@@ -197,24 +257,47 @@ export const useReefStore = defineStore('reef', () => {
     if (currentSiteId.value === id) selectSite(null)
   }
 
-  /** 站位 id → 样带数与平均白化指数（列表回显用） */
+  /** 站位 id → 样带数与平均白化指数（列表回显用，仅计入核定口径内的样带） */
   async function siteBleachAverages(): Promise<Record<string, number>> {
     const result: Record<string, number> = {}
     for (const site of sites.value) {
-      const beltIds = (await db.belts.where('siteId').equals(site.id).toArray()).map((row) => row.id)
-      if (beltIds.length === 0) {
+      const countedBeltIds = new Set(countedBeltsOfSite(site.id).map((belt) => belt.id))
+      if (countedBeltIds.size === 0) {
         result[site.id] = 0
         continue
       }
-      const corals = await db.corals.where('beltId').anyOf(beltIds).toArray()
+      const corals = await db.corals.where('beltId').anyOf([...countedBeltIds]).toArray()
       result[site.id] = round(bleachIndex(corals), 2)
     }
     return result
   }
 
+  /* ----------------------------- 核定口径 ----------------------------- */
+
+  /** 管理站手动核定（或调整）礁区样带上限 */
+  async function setReefQuota(reefId: string, quotaBelts: number, note?: string): Promise<void> {
+    const now = Date.now()
+    await db.reefs.update(reefId, {
+      quotaBelts: Math.max(0, Math.floor(quotaBelts)),
+      quotaCheckedAt: now,
+      quotaNote: note?.trim() || '管理站手动核定',
+      updatedAt: now
+    } as never)
+  }
+
+  /** 旧数据没核定：按当前面积与保护级别回填一版上限 */
+  async function backfillReefQuota(reefId: string): Promise<number> {
+    const reef = reefById(reefId)
+    if (!reef) return 0
+    const quota = computeQuotaBelts(reef.areaKm2, reef.protectStatus)
+    await setReefQuota(reefId, quota, '按面积与保护级别回填')
+    return quota
+  }
+
   return {
     reefs,
     sites,
+    belts,
     ready,
     error,
     currentReefId,
@@ -227,8 +310,18 @@ export const useReefStore = defineStore('reef', () => {
     filteredSites,
     hasFilter,
     reefStats,
+    reefQuotaStates,
+    quotaIndex,
     start,
     sitesOfReef,
+    quotaStateOf,
+    beltQuotaMark,
+    isBeltInQuota,
+    countedBeltsOfReef,
+    countedBeltsOfSite,
+    suggestQuota,
+    setReefQuota,
+    backfillReefQuota,
     patchFilter,
     resetFilter,
     patchSiteFilter,
